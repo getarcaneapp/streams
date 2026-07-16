@@ -3,6 +3,7 @@ package bus
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/moby/moby/api/types/events"
 )
@@ -38,17 +39,20 @@ func WithSubscriberBuffer(size int) SubscribeOption {
 
 // DockerEventBus is an in-process fan-out point for Docker daemon events.
 type DockerEventBus struct {
-	mu     sync.RWMutex
-	subs   map[events.Type]map[chan events.Message]struct{}
-	closed bool
-	onDrop func(events.Message)
+	deliveryMu sync.RWMutex
+	state      atomic.Pointer[dockerEventBusState]
+	onDrop     func(events.Message)
+}
+
+type dockerEventBusState struct {
+	closed      bool
+	subscribers map[events.Type][]chan events.Message
 }
 
 // NewDockerEventBus creates an empty Docker event bus.
 func NewDockerEventBus(opts ...Option) *DockerEventBus {
-	b := &DockerEventBus{
-		subs: make(map[events.Type]map[chan events.Message]struct{}),
-	}
+	b := &DockerEventBus{}
+	b.state.Store(newDockerEventBusStateInternal())
 	for _, opt := range opts {
 		opt(b)
 	}
@@ -67,33 +71,21 @@ func (b *DockerEventBus) Subscribe(eventType events.Type, opts ...SubscribeOptio
 		return ch, func() {}
 	}
 
-	b.mu.Lock()
-	if b.closed {
-		close(ch)
-		b.mu.Unlock()
-		return ch, func() {}
-	}
-	if b.subs[eventType] == nil {
-		b.subs[eventType] = make(map[chan events.Message]struct{})
-	}
-	b.subs[eventType][ch] = struct{}{}
-	b.mu.Unlock()
+	for {
+		current := b.loadStateInternal()
+		if current.closed {
+			close(ch)
+			return ch, func() {}
+		}
 
-	var once sync.Once
+		next := current.withSubscriptionInternal(eventType, ch)
+		if b.state.CompareAndSwap(current, next) {
+			break
+		}
+	}
+
 	return ch, func() {
-		once.Do(func() {
-			b.mu.Lock()
-			if subs := b.subs[eventType]; subs != nil {
-				if _, ok := subs[ch]; ok {
-					delete(subs, ch)
-					close(ch)
-				}
-				if len(subs) == 0 {
-					delete(b.subs, eventType)
-				}
-			}
-			b.mu.Unlock()
-		})
+		b.unsubscribeInternal(eventType, ch)
 	}
 }
 
@@ -103,21 +95,27 @@ func (b *DockerEventBus) Publish(msg events.Message) {
 		return
 	}
 
-	b.mu.RLock()
-	if b.closed {
-		b.mu.RUnlock()
+	state := b.state.Load()
+	if state == nil || state.closed || len(state.subscribers[msg.Type]) == 0 {
+		return
+	}
+
+	b.deliveryMu.RLock()
+	state = b.state.Load()
+	if state == nil || state.closed {
+		b.deliveryMu.RUnlock()
 		return
 	}
 	dropped := 0
-	for ch := range b.subs[msg.Type] {
+	for _, subscriber := range state.subscribers[msg.Type] {
 		select {
-		case ch <- msg:
+		case subscriber <- msg:
 		default:
 			dropped++
 		}
 	}
 	onDrop := b.onDrop
-	b.mu.RUnlock()
+	b.deliveryMu.RUnlock()
 
 	if onDrop != nil {
 		for range dropped {
@@ -131,17 +129,99 @@ func (b *DockerEventBus) Close() {
 	if b == nil {
 		return
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.closed {
+
+	for {
+		current := b.loadStateInternal()
+		if current.closed {
+			return
+		}
+
+		closed := &dockerEventBusState{closed: true}
+		if !b.state.CompareAndSwap(current, closed) {
+			continue
+		}
+
+		b.deliveryMu.Lock()
+		for _, subscribers := range current.subscribers {
+			for _, subscriber := range subscribers {
+				close(subscriber)
+			}
+		}
+		b.deliveryMu.Unlock()
 		return
 	}
-	b.closed = true
-	for eventType, subs := range b.subs {
-		for ch := range subs {
-			close(ch)
-			delete(subs, ch)
+}
+
+func newDockerEventBusStateInternal() *dockerEventBusState {
+	return &dockerEventBusState{subscribers: make(map[events.Type][]chan events.Message)}
+}
+
+func (b *DockerEventBus) loadStateInternal() *dockerEventBusState {
+	for {
+		state := b.state.Load()
+		if state != nil {
+			return state
 		}
-		delete(b.subs, eventType)
+
+		initial := newDockerEventBusStateInternal()
+		if b.state.CompareAndSwap(nil, initial) {
+			return initial
+		}
+	}
+}
+
+func (s *dockerEventBusState) withSubscriptionInternal(eventType events.Type, subscription chan events.Message) *dockerEventBusState {
+	subscribers := cloneDockerEventSubscribersInternal(s.subscribers)
+	subscribers[eventType] = append(append([]chan events.Message(nil), subscribers[eventType]...), subscription)
+	return &dockerEventBusState{subscribers: subscribers}
+}
+
+func (s *dockerEventBusState) withoutSubscriptionInternal(eventType events.Type, subscription chan events.Message) (*dockerEventBusState, bool) {
+	current := s.subscribers[eventType]
+	index := -1
+	for i, candidate := range current {
+		if candidate == subscription {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return s, false
+	}
+
+	subscribers := cloneDockerEventSubscribersInternal(s.subscribers)
+	if len(current) == 1 {
+		delete(subscribers, eventType)
+	} else {
+		next := make([]chan events.Message, 0, len(current)-1)
+		next = append(next, current[:index]...)
+		next = append(next, current[index+1:]...)
+		subscribers[eventType] = next
+	}
+
+	return &dockerEventBusState{closed: s.closed, subscribers: subscribers}, true
+}
+
+func cloneDockerEventSubscribersInternal(current map[events.Type][]chan events.Message) map[events.Type][]chan events.Message {
+	next := make(map[events.Type][]chan events.Message, len(current))
+	for eventType, subscriptions := range current {
+		next[eventType] = subscriptions
+	}
+	return next
+}
+
+func (b *DockerEventBus) unsubscribeInternal(eventType events.Type, subscription chan events.Message) {
+	for {
+		current := b.loadStateInternal()
+		next, found := current.withoutSubscriptionInternal(eventType, subscription)
+		if !found {
+			return
+		}
+		if b.state.CompareAndSwap(current, next) {
+			b.deliveryMu.Lock()
+			close(subscription)
+			b.deliveryMu.Unlock()
+			return
+		}
 	}
 }
