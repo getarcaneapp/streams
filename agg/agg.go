@@ -3,8 +3,9 @@ package agg
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"time"
@@ -23,7 +24,7 @@ type Producer[T any] func(ctx context.Context, events chan<- T)
 
 // Config configures Run.
 type Config[T any] struct {
-	Encoder           *json.Encoder
+	Writer            io.Writer
 	Flush             func()
 	Buffer            int
 	HeartbeatInterval time.Duration
@@ -78,13 +79,19 @@ func Run[T any](ctx context.Context, cfg Config[T]) error {
 		case <-streamCtx.Done():
 			return nil
 		case event := <-events:
-			if err := cfg.Encoder.Encode(event); err != nil {
+			if err := json.MarshalWrite(cfg.Writer, event); err != nil {
 				return fmt.Errorf("encode stream event: %w", err)
+			}
+			if _, err := io.WriteString(cfg.Writer, "\n"); err != nil {
+				return fmt.Errorf("terminate stream event: %w", err)
 			}
 			cfg.Flush()
 		case <-heartbeat:
-			if err := cfg.Encoder.Encode(cfg.MakeHeartbeat()); err != nil {
+			if err := json.MarshalWrite(cfg.Writer, cfg.MakeHeartbeat()); err != nil {
 				return fmt.Errorf("encode stream heartbeat: %w", err)
+			}
+			if _, err := io.WriteString(cfg.Writer, "\n"); err != nil {
+				return fmt.Errorf("terminate stream heartbeat: %w", err)
 			}
 			cfg.Flush()
 		}
@@ -92,8 +99,8 @@ func Run[T any](ctx context.Context, cfg Config[T]) error {
 }
 
 func (cfg Config[T]) validate() error {
-	if cfg.Encoder == nil {
-		return &InvalidConfigError{Field: "Encoder", Reason: "is required"}
+	if cfg.Writer == nil {
+		return &InvalidConfigError{Field: "Writer", Reason: "is required"}
 	}
 	if cfg.Flush == nil {
 		return &InvalidConfigError{Field: "Flush", Reason: "is required"}

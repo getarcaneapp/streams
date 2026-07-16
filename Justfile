@@ -1,5 +1,7 @@
 set working-directory := './'
 
+export GOEXPERIMENT := "jsonv2"
+
 _default:
     @just --list
 

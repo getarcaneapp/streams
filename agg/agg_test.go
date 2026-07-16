@@ -3,7 +3,6 @@ package agg
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -24,8 +23,8 @@ func TestRunRejectsInvalidConfig(t *testing.T) {
 
 func TestRunReturnsEncodeError(t *testing.T) {
 	err := Run(context.Background(), Config[string]{
-		Encoder: json.NewEncoder(failingWriter{}),
-		Flush:   func() {},
+		Writer: failingWriter{},
+		Flush:  func() {},
 		Producers: []Producer[string]{
 			func(ctx context.Context, events chan<- string) {
 				Send(ctx, events, "event")
@@ -43,8 +42,8 @@ func TestRunAllowsNoHeartbeat(t *testing.T) {
 
 	var out bytes.Buffer
 	err := Run(ctx, Config[string]{
-		Encoder: json.NewEncoder(&out),
-		Flush:   cancel,
+		Writer: &out,
+		Flush:  cancel,
 		Producers: []Producer[string]{
 			func(ctx context.Context, events chan<- string) {
 				Send(ctx, events, "event")
