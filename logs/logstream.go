@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,13 +39,18 @@ func WithSubscriberBuffer(size int) Option {
 // Broadcaster keeps a bounded ring buffer of recent log entries and fans new
 // entries out to active subscribers.
 type Broadcaster struct {
-	mu               sync.Mutex
+	historyMu        sync.Mutex
+	deliveryMu       sync.RWMutex
 	buf              []Entry
 	start            int
 	size             int
 	capN             int
 	subscriberBuffer int
-	subs             map[chan Entry]struct{}
+	subscribers      atomic.Pointer[logSubscriberSnapshot]
+}
+
+type logSubscriberSnapshot struct {
+	subscribers []chan Entry
 }
 
 // New returns a Broadcaster retaining up to capacity recent entries.
@@ -56,8 +62,8 @@ func New(capacity int, opts ...Option) *Broadcaster {
 		buf:              make([]Entry, capacity),
 		capN:             capacity,
 		subscriberBuffer: defaultSubscriberBuffer,
-		subs:             make(map[chan Entry]struct{}),
 	}
+	b.subscribers.Store(&logSubscriberSnapshot{})
 	for _, opt := range opts {
 		opt(b)
 	}
@@ -66,8 +72,7 @@ func New(capacity int, opts ...Option) *Broadcaster {
 
 // Append records an entry in the ring buffer and delivers it to subscribers.
 func (b *Broadcaster) Append(e Entry) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.historyMu.Lock()
 
 	if b.size < b.capN {
 		b.buf[(b.start+b.size)%b.capN] = e
@@ -76,19 +81,28 @@ func (b *Broadcaster) Append(e Entry) {
 		b.buf[b.start] = e
 		b.start = (b.start + 1) % b.capN
 	}
+	b.historyMu.Unlock()
 
-	for ch := range b.subs {
+	snapshot := b.subscribers.Load()
+	if snapshot == nil || len(snapshot.subscribers) == 0 {
+		return
+	}
+
+	b.deliveryMu.RLock()
+	snapshot = b.subscribers.Load()
+	for _, subscription := range snapshot.subscribers {
 		select {
-		case ch <- e:
+		case subscription <- e:
 		default:
 		}
 	}
+	b.deliveryMu.RUnlock()
 }
 
 // Recent returns buffered entries in chronological order.
 func (b *Broadcaster) Recent() []Entry {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.historyMu.Lock()
+	defer b.historyMu.Unlock()
 
 	out := make([]Entry, b.size)
 	for i := range b.size {
@@ -100,20 +114,60 @@ func (b *Broadcaster) Recent() []Entry {
 // Subscribe registers a live subscriber.
 func (b *Broadcaster) Subscribe() (<-chan Entry, func()) {
 	ch := make(chan Entry, b.subscriberBuffer)
-	b.mu.Lock()
-	b.subs[ch] = struct{}{}
-	b.mu.Unlock()
+	for {
+		current := b.loadSubscribersInternal()
+		nextSubscribers := append(append([]chan Entry(nil), current.subscribers...), ch)
+		next := &logSubscriberSnapshot{subscribers: nextSubscribers}
+		if b.subscribers.CompareAndSwap(current, next) {
+			break
+		}
+	}
 
-	var once sync.Once
 	cancel := func() {
-		once.Do(func() {
-			b.mu.Lock()
-			delete(b.subs, ch)
-			close(ch)
-			b.mu.Unlock()
-		})
+		b.unsubscribeInternal(ch)
 	}
 	return ch, cancel
+}
+
+func (b *Broadcaster) loadSubscribersInternal() *logSubscriberSnapshot {
+	for {
+		current := b.subscribers.Load()
+		if current != nil {
+			return current
+		}
+
+		initial := &logSubscriberSnapshot{}
+		if b.subscribers.CompareAndSwap(nil, initial) {
+			return initial
+		}
+	}
+}
+
+func (b *Broadcaster) unsubscribeInternal(subscription chan Entry) {
+	for {
+		current := b.loadSubscribersInternal()
+		index := -1
+		for i, candidate := range current.subscribers {
+			if candidate == subscription {
+				index = i
+				break
+			}
+		}
+		if index < 0 {
+			return
+		}
+
+		nextSubscribers := make([]chan Entry, 0, len(current.subscribers)-1)
+		nextSubscribers = append(nextSubscribers, current.subscribers[:index]...)
+		nextSubscribers = append(nextSubscribers, current.subscribers[index+1:]...)
+		next := &logSubscriberSnapshot{subscribers: nextSubscribers}
+		if b.subscribers.CompareAndSwap(current, next) {
+			b.deliveryMu.Lock()
+			close(subscription)
+			b.deliveryMu.Unlock()
+			return
+		}
+	}
 }
 
 // slogHandler wraps a base slog.Handler and appends handled records to a

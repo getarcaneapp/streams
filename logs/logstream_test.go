@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -89,5 +90,105 @@ func TestSubscribeUsesConfiguredBuffer(t *testing.T) {
 	case extra := <-ch:
 		t.Fatalf("unexpected extra entry despite full subscriber buffer: %#v", extra)
 	default:
+	}
+}
+
+func TestRecentCapsAndPreservesOrder(t *testing.T) {
+	b := New(3)
+	for _, message := range []string{"one", "two", "three", "four", "five"} {
+		b.Append(Entry{Message: message})
+	}
+
+	entries := b.Recent()
+	if len(entries) != 3 {
+		t.Fatalf("Recent returned %d entries, want 3", len(entries))
+	}
+	for i, want := range []string{"three", "four", "five"} {
+		if entries[i].Message != want {
+			t.Fatalf("entry[%d].Message = %q, want %q", i, entries[i].Message, want)
+		}
+	}
+}
+
+func TestCancelClosesSubscription(t *testing.T) {
+	b := New(10)
+	ch, cancel := b.Subscribe()
+	cancel()
+	cancel()
+
+	if _, ok := <-ch; ok {
+		t.Fatal("subscription channel remained open after cancel")
+	}
+}
+
+func TestConcurrentAppendCancelAndRecent(t *testing.T) {
+	b := New(32, WithSubscriberBuffer(1))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range 500 {
+				b.Append(Entry{Message: "concurrent"})
+			}
+		}()
+	}
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range 500 {
+				if entries := b.Recent(); len(entries) > 32 {
+					t.Errorf("Recent returned %d entries, capacity is 32", len(entries))
+					return
+				}
+			}
+		}()
+	}
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range 250 {
+				ch, cancel := b.Subscribe()
+				cancel()
+				for range ch {
+				}
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	if entries := b.Recent(); len(entries) != 32 {
+		t.Fatalf("Recent returned %d entries after concurrent appends, want 32", len(entries))
+	}
+}
+
+func BenchmarkBroadcasterAppend(b *testing.B) {
+	b.Run("no-subscribers", func(b *testing.B) {
+		benchmarkBroadcasterAppend(b, 0)
+	})
+	b.Run("sixteen-subscribers", func(b *testing.B) {
+		benchmarkBroadcasterAppend(b, 16)
+	})
+}
+
+func benchmarkBroadcasterAppend(b *testing.B, subscriberCount int) {
+	broadcaster := New(1000, WithSubscriberBuffer(0))
+	for range subscriberCount {
+		_, _ = broadcaster.Subscribe()
+	}
+
+	entry := Entry{Message: "benchmark"}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		broadcaster.Append(entry)
 	}
 }
