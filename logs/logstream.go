@@ -304,6 +304,8 @@ func normalizeAttrValueInternal(value slog.Value) any {
 
 func normalizeAnyValueInternal(value any) any {
 	switch typed := value.(type) {
+	case error:
+		return typed.Error()
 	case slog.Attr:
 		return map[string]any{typed.Key: normalizeAttrValueInternal(typed.Value)}
 	case []slog.Attr:

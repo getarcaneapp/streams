@@ -2,6 +2,9 @@ package logs
 
 import (
 	"context"
+	json "encoding/json/v2"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"reflect"
@@ -44,6 +47,28 @@ func TestSlogHandlerNormalizesGroupedAttrsInternal(t *testing.T) {
 	}
 	if !reflect.DeepEqual(entries[0].Attrs["ids"], []any{"one", "two"}) {
 		t.Fatalf("ids attr = %#v, want []any", entries[0].Attrs["ids"])
+	}
+}
+
+func TestSlogHandlerNormalizesErrorsInternal(t *testing.T) {
+	b := New(10)
+	h := NewSlogHandler(slog.NewTextHandler(io.Discard, nil), b)
+	record := slog.NewRecord(time.Unix(1, 0).UTC(), slog.LevelError, "request failed", 0)
+	record.AddAttrs(slog.Any("error", fmt.Errorf("request: %w", errors.New("connection refused"))))
+
+	if err := h.Handle(context.Background(), record); err != nil {
+		t.Fatalf("Handle failed: %v", err)
+	}
+
+	entries := b.Recent()
+	if len(entries) != 1 {
+		t.Fatalf("Recent returned %d entries, want 1", len(entries))
+	}
+	if entries[0].Attrs["error"] != "request: connection refused" {
+		t.Fatalf("error attr = %#v, want string", entries[0].Attrs["error"])
+	}
+	if _, err := json.Marshal(entries); err != nil {
+		t.Fatalf("marshal entries: %v", err)
 	}
 }
 
